@@ -1,12 +1,24 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from typing import List
 import os
+import json
 from dotenv import load_dotenv
 
+# Core imports
 from core.logger import get_logger
-from core.exceptions import DocumentProcessingError
+from core.exceptions import DocumentProcessingError, ParsingError, UnsupportedFileTypeError
+from core.parser import parse_document
+from core.db import get_db_connection
+from core.llm import get_azure_openai_client
 
-# Load environment variables and initialize logger
+# Agent imports
+from agents.summarization_agent import SummarizationAgent
+from agents.entity_extraction_agent import EntityExtractionAgent
+
+# Vector DB import
+from pgvector.psycopg2 import register_vector
+
+# --- Initialization ---
 load_dotenv()
 logger = get_logger(__name__)
 
@@ -15,69 +27,114 @@ app = FastAPI(
     description="API for document ingestion, summarization, and Q&A.",
 )
 
-# --- In-memory storage for uploaded file paths (for simplicity) ---
-# In a real app, you might use a temporary storage service or a DB entry
-processed_files = {}
+# Initialize clients and agents
+try:
+    openai_client = get_azure_openai_client()
+    completion_model = os.getenv("COMPLETION_DEPLOYMENT_NAME")
+    embedding_model = os.getenv("EMBEDDING_DEPLOYMENT_NAME")
+    
+    summarizer = SummarizationAgent(openai_client, completion_model)
+    entity_extractor = EntityExtractionAgent(openai_client, completion_model)
+    logger.info("Clients and agents initialized successfully.")
+except Exception as e:
+    logger.error(f"Fatal error during initialization: {e}")
+    openai_client = None # Ensure app knows client failed
 
 @app.on_event("startup")
 async def startup_event():
+    if not openai_client:
+        logger.error("Azure OpenAI client not available. API will not function correctly.")
     logger.info("FastAPI application starting up.")
-    # Here you would initialize DB connections, etc.
-    # For now, we just log.
+
+# --- API Endpoints ---
 
 @app.post("/ingest/", summary="Ingest and process documents")
 async def ingest_documents(files: List[UploadFile] = File(...)):
-    """
-    Endpoint to upload and trigger the processing of multiple documents.
-    """
-    filenames = [file.filename for file in files]
-    logger.info(f"Received {len(filenames)} files for ingestion: {', '.join(filenames)}")
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="AI services are unavailable.")
 
-    # --- Placeholder for Agent Workflow ---
-    # This is where the full agent workflow from Milestone 2/3 will be called.
-    # For now, we simulate processing and handle potential errors.
-    try:
-        for file in files:
-            # Simulate processing
+    processed_docs = []
+    for file in files:
+        try:
             logger.info(f"Processing file: {file.filename}")
-            # In a real scenario, you would save the file temporarily
-            # and then pass it to the parsing/summarization agents.
             
-            # Example of using custom exceptions
-            if file.filename.endswith(".txt"):
-                 raise DocumentProcessingError(f"Simulating a processing error for {file.filename}")
+            # 1. Parse Document
+            content = parse_document(file)
+            if not content.strip():
+                logger.warning(f"No content extracted from {file.filename}. Skipping.")
+                continue
 
-            processed_files[file.filename] = {"status": "processed", "summary": f"This is a summary for {file.filename}."}
-        
-        return {"message": "Files processed successfully", "processed_files": list(processed_files.keys())}
+            # 2. Run Agents
+            summary_data = summarizer.summarize(content)
+            entities_data = entity_extractor.extract(content)
 
-    except DocumentProcessingError as e:
-        logger.error(f"A processing error occurred: {e.message}")
-        # HTTP 422: Unprocessable Entity
-        raise HTTPException(status_code=422, detail=e.message)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during ingestion: {e}")
-        # HTTP 500: Internal Server Error
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+            # 3. Generate Embedding
+            embedding_response = openai_client.embeddings.create(input=[content], model=embedding_model)
+            embedding = embedding_response.data[0].embedding
+
+            # 4. Save to Database
+            conn = get_db_connection()
+            register_vector(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO documents (filename, content, summary, entities, embedding)
+                    VALUES (%s, %s, %s, %s, %s) RETURNING id;
+                    """,
+                    (file.filename, content, summary_data.get('summary'), json.dumps(entities_data), embedding)
+                )
+                doc_id = cur.fetchone()['id']
+                conn.commit()
+            conn.close()
+            
+            processed_docs.append({"id": doc_id, "filename": file.filename})
+            logger.info(f"Successfully ingested and saved document id: {doc_id}")
+
+        except (ParsingError, UnsupportedFileTypeError) as e:
+            logger.error(f"Document processing failed for {file.filename}: {e.message}")
+            raise HTTPException(status_code=422, detail=e.message)
+        except Exception as e:
+            logger.error(f"An unexpected error occurred processing {file.filename}: {e}")
+            raise HTTPException(status_code=500, detail=f"An internal server error occurred for {file.filename}.")
+
+    return {"message": "Files processed successfully", "processed_documents": processed_docs}
 
 
 @app.get("/documents/", summary="List processed documents")
 async def get_documents():
-    """
-    Endpoint to retrieve the list of successfully processed documents.
-    """
-    return {"documents": list(processed_files.keys())}
+    """Retrieves list of documents from the database."""
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, filename FROM documents ORDER BY created_at DESC;")
+        docs = cur.fetchall()
+    conn.close()
+    return {"documents": docs}
 
 
-@app.get("/summary/{filename}", summary="Get summary of a document")
-async def get_summary(filename: str):
-    """
-    Endpoint to retrieve the summary for a specific document.
-    """
-    if filename not in processed_files:
+@app.get("/document/{doc_id}", summary="Get all data for a document")
+async def get_document_data(doc_id: int):
+    """Retrieves the summary and entities for a specific document."""
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, filename, summary, entities FROM documents WHERE id = %s;", (doc_id,))
+        data = cur.fetchone()
+    conn.close()
+    if not data:
         raise HTTPException(status_code=404, detail="Document not found.")
-    
-    summary_data = processed_files.get(filename, {})
-    return {"filename": filename, "summary": summary_data.get("summary")}
+    return data
 
-# Add other endpoints for Q&A, etc. as you build them.
+
+@app.put("/document/{doc_id}", summary="Update a document's summary")
+async def update_summary(doc_id: int, update_data: dict):
+    """Updates the summary for a given document ID."""
+    summary = update_data.get('summary')
+    if summary is None:
+        raise HTTPException(status_code=400, detail="No summary provided in request body.")
+    
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE documents SET summary = %s WHERE id = %s;", (summary, doc_id))
+        conn.commit()
+    conn.close()
+    logger.info(f"Updated summary for document id: {doc_id}")
+    return {"message": "Summary updated successfully."}
