@@ -30,6 +30,9 @@ try:
     openai_client = get_azure_openai_client()
     completion_model = os.getenv("COMPLETION_DEPLOYMENT_NAME")
     embedding_model = os.getenv("EMBEDDING_DEPLOYMENT_NAME")
+
+    if not completion_model or not embedding_model:
+        raise ValueError("COMPLETION_DEPLOYMENT_NAME and EMBEDDING_DEPLOYMENT_NAME must be set in the .env file.")
     
     summarizer = SummarizationAgent(openai_client, completion_model)
     entity_extractor = EntityExtractionAgent(openai_client, completion_model)
@@ -64,8 +67,12 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
             summary_data = summarizer.summarize(content)
             entities_data = entity_extractor.extract(content)
 
-            embedding_response = openai_client.embeddings.create(input=[content], model=embedding_model)
-            embedding = embedding_response.data[0].embedding
+            logger.warning("WORKAROUND ACTIVE: Bypassing real embedding generation and using a dummy vector.")
+            # Create a dummy vector of the correct dimension (1536 for ada-002)
+            embedding = [0.0] * 1536 
+
+            # embedding_response = openai_client.embeddings.create(input=[content], model=embedding_model)
+            # embedding = embedding_response.data[0].embedding
 
             # 4. Save to Database
             conn = get_db_connection()
