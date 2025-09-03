@@ -58,44 +58,52 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
         try:
             logger.info(f"Processing file: {file.filename}")
             
-            # 1. Parse Document
             content = parse_document(file)
             if not content.strip():
                 logger.warning(f"No content extracted from {file.filename}. Skipping.")
                 continue
 
-            # 2. Run Agents
             summary_data = summarizer.summarize(content)
             entities_data = entity_extractor.extract(content)
 
-            # 3. Generate Embedding
             embedding_response = openai_client.embeddings.create(input=[content], model=embedding_model)
             embedding = embedding_response.data[0].embedding
 
-            # 4. Save to Database
+            # --- Database Saving Logic ---
             conn = get_db_connection()
-            register_vector(conn)
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO documents (filename, content, summary, entities, embedding)
-                    VALUES (%s, %s, %s, %s, %s) RETURNING id;
-                    """,
-                    (file.filename, content, summary_data.get('summary'), json.dumps(entities_data), embedding)
-                )
-                doc_id = cur.fetchone()['id']
-                conn.commit()
-            conn.close()
+            if not conn:
+                # If connection fails, raise an error immediately
+                raise HTTPException(status_code=503, detail="Database connection could not be established.")
             
-            processed_docs.append({"id": doc_id, "filename": file.filename})
-            logger.info(f"Successfully ingested and saved document id: {doc_id}")
+            try:
+                # THIS IS THE CRITICAL FIX: Register the vector type with the connection
+                register_vector(conn)
+                
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO documents (filename, content, summary, entities, embedding)
+                        VALUES (%s, %s, %s, %s, %s) RETURNING id;
+                        """,
+                        (file.filename, content, summary_data.get('summary'), json.dumps(entities_data), embedding)
+                    )
+                    doc_id = cur.fetchone()['id']
+                    conn.commit()
+                
+                processed_docs.append({"id": doc_id, "filename": file.filename})
+                logger.info(f"Successfully ingested and saved document id: {doc_id}")
+
+            finally:
+                # Ensure the connection is always closed
+                conn.close()
 
         except (ParsingError, UnsupportedFileTypeError) as e:
             logger.error(f"Document processing failed for {file.filename}: {e.message}")
             raise HTTPException(status_code=422, detail=e.message)
         except Exception as e:
             logger.error(f"An unexpected error occurred processing {file.filename}: {e}")
-            raise HTTPException(status_code=500, detail=f"An internal server error occurred for {file.filename}.")
+            # This will now catch the "Unsupported data type" if the fix fails, and other errors.
+            raise HTTPException(status_code=500, detail=f"An internal server error occurred for {file.filename}: {str(e)}")
 
     return {"message": "Files processed successfully", "processed_documents": processed_docs}
 
