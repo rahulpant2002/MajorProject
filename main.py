@@ -31,13 +31,13 @@ try:
     openai_client = get_azure_openai_client()
     completion_model = os.getenv("COMPLETION_DEPLOYMENT_NAME")
     embedding_model = os.getenv("EMBEDDING_DEPLOYMENT_NAME")
-
-    if not completion_model or not embedding_model:
-        raise ValueError("COMPLETION_DEPLOYMENT_NAME and EMBEDDING_DEPLOYMENT_NAME must be set in the .env file.")
     
+    if not completion_model:
+        raise ValueError("COMPLETION_DEPLOYMENT_NAME must be set in the .env file.")
+
     summarizer = SummarizationAgent(openai_client, completion_model)
     entity_extractor = EntityExtractionAgent(openai_client, completion_model)
-    validator = ValidationAgent(openai_client, completion_model) 
+    validator = ValidationAgent(openai_client, completion_model)
     logger.info("Clients and agents initialized successfully.")
 except Exception as e:
     logger.error(f"Fatal error during initialization: {e}", exc_info=True)
@@ -66,9 +66,10 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
                 logger.warning(f"No content extracted from {file.filename}. Skipping.")
                 continue
 
+            # --- AGENT WORKFLOW ---
             summary_data = summarizer.summarize(content)
             entities_data = entity_extractor.extract(content)
-
+            
             # --- VALIDATION STEP ---
             summary_text = summary_data.get("summary", "")
             is_valid = validator.validate_summary(content, summary_text)
@@ -77,27 +78,25 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
             if not is_valid:
                 logger.warning(f"Summary for {file.filename} failed validation. Status set to 'needs_review'.")
 
+            # --- TEMPORARY WORKAROUND FOR MISSING EMBEDDING MODEL ---
             logger.warning("WORKAROUND ACTIVE: Bypassing real embedding generation and using a dummy vector.")
-            # Create a dummy vector of the correct dimension (1536 for ada-002)
             embedding = [0.0] * 1536 
 
-            # embedding_response = openai_client.embeddings.create(input=[content], model=embedding_model)
-            # embedding = embedding_response.data[0].embedding
-
-            # 4. Save to Database
+            # --- DATABASE SAVING ---
             conn = get_db_connection()
             if not conn:
                 raise HTTPException(status_code=503, detail="Database connection could not be established.")
             
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO documents (filename, content, summary, entities, embedding)
-                        VALUES (%s, %s, %s, %s, %s) RETURNING id;
-                        """,
-                        (file.filename, content, summary_data.get('summary'), json.dumps(entities_data), embedding, doc_status)
-                    )
+                    sql_query = """
+                        INSERT INTO documents (filename, content, summary, entities, embedding, status)
+                        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+                    """
+                    values = (file.filename, content, summary_text, json.dumps(entities_data), embedding, doc_status)
+                    
+                    cur.execute(sql_query, values)
+                    
                     result = cur.fetchone()
                     doc_id = result['id'] if result else None
                     conn.commit()
@@ -129,11 +128,12 @@ async def get_documents():
         raise HTTPException(status_code=503, detail="Database connection is unavailable.")
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, filename FROM documents ORDER BY created_at DESC;")
+            cur.execute("SELECT id, filename, status FROM documents ORDER BY created_at DESC;")
             docs = cur.fetchall()
         return {"documents": docs}
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 @app.get("/document/{doc_id}", summary="Get all data for a document")
@@ -144,13 +144,14 @@ async def get_document_data(doc_id: int):
         raise HTTPException(status_code=503, detail="Database connection is unavailable.")
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, filename, summary, entities FROM documents WHERE id = %s;", (doc_id,))
+            cur.execute("SELECT id, filename, summary, entities, status FROM documents WHERE id = %s;", (doc_id,))
             data = cur.fetchone()
         if not data:
             raise HTTPException(status_code=404, detail="Document not found.")
         return data
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 @app.put("/document/{doc_id}", summary="Update a document's summary")
@@ -165,9 +166,11 @@ async def update_summary(doc_id: int, update_data: dict):
         raise HTTPException(status_code=503, detail="Database connection is unavailable.")
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE documents SET summary = %s WHERE id = %s;", (summary, doc_id))
+            # Also update the status to 'processed' since a human has intervened
+            cur.execute("UPDATE documents SET summary = %s, status = 'processed' WHERE id = %s;", (summary, doc_id))
             conn.commit()
         logger.info(f"Updated summary for document id: {doc_id}")
         return {"message": "Summary updated successfully."}
     finally:
-        conn.close()
+        if conn:
+            conn.close()
