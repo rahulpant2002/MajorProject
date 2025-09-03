@@ -6,3 +6,7 @@ pypdf
 python-docx
 beautifulsoup4
 lxml
+python-dotenv
+fastapi
+uvicorn[standard]
+requests
