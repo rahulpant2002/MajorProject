@@ -15,6 +15,7 @@ from core.llm import get_azure_openai_client
 # Agent imports
 from agents.summarization_agent import SummarizationAgent
 from agents.entity_extraction_agent import EntityExtractionAgent
+from agents.validation_agent import ValidationAgent
 
 # --- Initialization ---
 load_dotenv()
@@ -36,6 +37,7 @@ try:
     
     summarizer = SummarizationAgent(openai_client, completion_model)
     entity_extractor = EntityExtractionAgent(openai_client, completion_model)
+    validator = ValidationAgent(openai_client, completion_model) 
     logger.info("Clients and agents initialized successfully.")
 except Exception as e:
     logger.error(f"Fatal error during initialization: {e}", exc_info=True)
@@ -67,6 +69,14 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
             summary_data = summarizer.summarize(content)
             entities_data = entity_extractor.extract(content)
 
+            # --- VALIDATION STEP ---
+            summary_text = summary_data.get("summary", "")
+            is_valid = validator.validate_summary(content, summary_text)
+            doc_status = "processed" if is_valid else "needs_review"
+            
+            if not is_valid:
+                logger.warning(f"Summary for {file.filename} failed validation. Status set to 'needs_review'.")
+
             logger.warning("WORKAROUND ACTIVE: Bypassing real embedding generation and using a dummy vector.")
             # Create a dummy vector of the correct dimension (1536 for ada-002)
             embedding = [0.0] * 1536 
@@ -86,7 +96,7 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
                         INSERT INTO documents (filename, content, summary, entities, embedding)
                         VALUES (%s, %s, %s, %s, %s) RETURNING id;
                         """,
-                        (file.filename, content, summary_data.get('summary'), json.dumps(entities_data), embedding)
+                        (file.filename, content, summary_data.get('summary'), json.dumps(entities_data), embedding, doc_status)
                     )
                     result = cur.fetchone()
                     doc_id = result['id'] if result else None
