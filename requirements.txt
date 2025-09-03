@@ -1,0 +1,8 @@
+streamlit
+openai
+psycopg2-binary
+pgvector
+pypdf
+python-docx
+beautifulsoup4
+lxml
